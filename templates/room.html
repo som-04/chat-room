@@ -1,0 +1,251 @@
+{% extends 'base.html' %} {% block content %}
+<div class="message-box">
+    <h2>Chat Room: {{code}}</h2>
+    <div class="voice-panel">
+        <div class="voice-controls">
+            <button type="button" id="voice-toggle" class="voice-btn">
+                Enable Voice
+            </button>
+            <button
+                type="button"
+                id="voice-mute"
+                class="voice-btn"
+                disabled
+            >
+                Mute
+            </button>
+            <span id="voice-status" class="voice-status">Voice: off</span>
+        </div>
+        <div id="voice-audio" class="voice-audio"></div>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="inputs">
+        <input
+            type="text"
+            rows="3"
+            placeholder="Message"
+            name="message"
+            id="message"
+            class="chat-box"
+        />
+        <button
+            type="button"
+            name="send"
+            id="send-button"
+            class="send-btn"
+            onClick="sendMessage()"
+        >
+            Send
+        </button>
+    </div>
+</div>
+<script type="text/javascript">
+    var socket = io();
+    const messages = document.getElementById("messages");
+    const createMessage = (name, msg) => {
+        const content = `
+        <div class="text">
+          <span>
+            <strong>${name}</strong>: ${msg}
+          </span>
+          <span class="muted">
+            ${new Date().toLocaleString()}
+          </span>
+        </div>
+        `;
+        messages.innerHTML += content;
+    };
+    socket.on("message", (data) => {
+        createMessage(data.name, data.message);
+    });
+    const sendMessage = () => {
+        const message = document.getElementById("message");
+        if (message.value == "") return;
+        socket.emit("message", { data: message.value });
+        message.value = "";
+    };
+
+    const voiceToggle = document.getElementById("voice-toggle");
+    const voiceMute = document.getElementById("voice-mute");
+    const voiceStatus = document.getElementById("voice-status");
+    const voiceAudio = document.getElementById("voice-audio");
+
+    let localStream = null;
+    let isMuted = false;
+    let voiceEnabled = false;
+    const peerConnections = new Map();
+
+    const rtcConfig = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    };
+
+    const setVoiceStatus = (text) => {
+        voiceStatus.textContent = text;
+    };
+
+    const addRemoteAudio = (peerId, stream) => {
+        let audio = document.getElementById(`audio-${peerId}`);
+        if (!audio) {
+            audio = document.createElement("audio");
+            audio.id = `audio-${peerId}`;
+            audio.autoplay = true;
+            audio.controls = false;
+            voiceAudio.appendChild(audio);
+        }
+        audio.srcObject = stream;
+    };
+
+    const removeRemoteAudio = (peerId) => {
+        const audio = document.getElementById(`audio-${peerId}`);
+        if (audio) {
+            audio.srcObject = null;
+            audio.remove();
+        }
+    };
+
+    const cleanupPeer = (peerId) => {
+        const pc = peerConnections.get(peerId);
+        if (pc) {
+            pc.close();
+            peerConnections.delete(peerId);
+        }
+        removeRemoteAudio(peerId);
+    };
+
+    const createPeerConnection = (peerId, isInitiator) => {
+        if (peerConnections.has(peerId)) return peerConnections.get(peerId);
+        const pc = new RTCPeerConnection(rtcConfig);
+        peerConnections.set(peerId, pc);
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                socket.emit("voice_signal", {
+                    to: peerId,
+                    candidate: event.candidate,
+                });
+            }
+        };
+
+        pc.ontrack = (event) => {
+            addRemoteAudio(peerId, event.streams[0]);
+        };
+
+        if (localStream) {
+            localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+        }
+
+        if (isInitiator) {
+            pc.createOffer()
+                .then((offer) => pc.setLocalDescription(offer))
+                .then(() => {
+                    socket.emit("voice_signal", {
+                        to: peerId,
+                        description: pc.localDescription,
+                    });
+                })
+                .catch((error) => {
+                    console.error("Voice offer error", error);
+                });
+        }
+
+        return pc;
+    };
+
+    const startVoice = async () => {
+        if (localStream) return;
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false,
+            });
+            socket.emit("voice_join");
+            voiceEnabled = true;
+            voiceToggle.textContent = "Disable Voice";
+            voiceMute.disabled = false;
+            setVoiceStatus("Voice: on");
+        } catch (error) {
+            console.error("Microphone access denied", error);
+            setVoiceStatus("Voice: blocked");
+        }
+    };
+
+    const stopVoice = () => {
+        if (localStream) {
+            localStream.getTracks().forEach((track) => track.stop());
+            localStream = null;
+        }
+        peerConnections.forEach((_, peerId) => cleanupPeer(peerId));
+        socket.emit("voice_leave");
+        voiceEnabled = false;
+        voiceToggle.textContent = "Enable Voice";
+        voiceMute.disabled = true;
+        isMuted = false;
+        voiceMute.textContent = "Mute";
+        setVoiceStatus("Voice: off");
+    };
+
+    const toggleMute = () => {
+        if (!localStream) return;
+        isMuted = !isMuted;
+        localStream.getAudioTracks().forEach((track) => {
+            track.enabled = !isMuted;
+        });
+        voiceMute.textContent = isMuted ? "Unmute" : "Mute";
+    };
+
+    voiceToggle.addEventListener("click", () => {
+        if (localStream) {
+            stopVoice();
+        } else {
+            startVoice();
+        }
+    });
+
+    voiceMute.addEventListener("click", toggleMute);
+
+    socket.on("voice_peers", (data) => {
+        if (!voiceEnabled) return;
+        data.peers.forEach((peer) => {
+            createPeerConnection(peer.id, false);
+        });
+    });
+
+    socket.on("voice_peer_joined", (peer) => {
+        if (!voiceEnabled) return;
+        createPeerConnection(peer.id, true);
+    });
+
+    socket.on("voice_peer_left", (peer) => {
+        cleanupPeer(peer.id);
+    });
+
+    socket.on("voice_signal", async (data) => {
+        if (!voiceEnabled) return;
+        const peerId = data.from;
+        const pc = createPeerConnection(peerId, false);
+
+        if (data.description) {
+            const description = new RTCSessionDescription(data.description);
+            await pc.setRemoteDescription(description);
+            if (description.type === "offer") {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit("voice_signal", {
+                    to: peerId,
+                    description: pc.localDescription,
+                });
+            }
+        } else if (data.candidate) {
+            try {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            } catch (error) {
+                console.error("ICE candidate error", error);
+            }
+        }
+    });
+</script>
+{% for msg in messages %}
+<script type="text/javascript">
+    createMessage("{{msg.name}}", "{{msg.message}}");
+</script>
+{% endfor %} {% endblock %}
